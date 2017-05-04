@@ -173,7 +173,6 @@ namespace GraphView
             this.edgeFieldIndex = edgeFieldIndex;
             this.traversalType = traversalType;
             this.sinkVertexQuery = sinkVertexQuery;
-            //this.sinkVertexViaExternalAPIQuery = sinkVertexViaExternalAPIQuery;
             this.matchingIndexes = matchingIndexes;
             this.outputBufferSize = outputBufferSize;
         }
