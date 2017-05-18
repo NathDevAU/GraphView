@@ -17,7 +17,11 @@ namespace GraphViewUnitTest.Gremlin.ProcessTests
         {
             using (GraphViewCommand command = new GraphViewCommand(graphConnection))
             {
-                var traversal = command.g().V().Project("a").Select("a").Values("name");
+                // var traversal = command.g().Inject(0).Union(command.g().V().Group(), command.g().E().Group()).Select(GremlinKeyword.Column.Keys).Values("name");
+                //var traversal = command.g().V().GroupCount().Unfold().Select(GremlinKeyword.Column.Keys).Values("name");
+                // var traversal = command.g().V().Group().By().By(GraphTraversal2.__().Count()).Select(GremlinKeyword.Column.Keys).Unfold().Values("name");
+
+                var traversal = command.g().V().OutE().Properties().Drop();
                 var result = traversal.Next();
             }
         }
@@ -51,6 +55,21 @@ namespace GraphViewUnitTest.Gremlin.ProcessTests
             using (GraphViewCommand command = new GraphViewCommand(graphConnection)) {
                 var traversal = command.g().V().Has("name", "marko").Properties("age").Drop();
                 var result = traversal.Next();
+                Debugger.Break();
+            }
+        }
+
+
+        [TestMethod]
+        public void NoneReversedEdges()
+        {
+            using (GraphViewCommand command = new GraphViewCommand(graphConnection))
+            {
+                var result = command.g().V().BothE().Next();
+                foreach (var r in result)
+                {
+                    Console.WriteLine(r);
+                }
                 Debugger.Break();
             }
         }

@@ -80,7 +80,7 @@ namespace GraphView
         //private JsonQuery vertexViaExternalAPIQuery;
         private GraphViewConnection connection;
 
-        private IEnumerator<RawRecord> verticesEnumerator;
+        private IEnumerator<Tuple<VertexField, RawRecord>> verticesEnumerator;
         //private IEnumerator<RawRecord> verticesViaExternalAPIEnumerator;
 
         public FetchNodeOperator2(GraphViewConnection connection, JsonQuery vertexQuery/*, JsonQuery vertexViaExternalAPIQuery*/)
@@ -89,14 +89,14 @@ namespace GraphView
             this.connection = connection;
             this.vertexQuery = vertexQuery;
             //this.vertexViaExternalAPIQuery = vertexViaExternalAPIQuery;
-            this.verticesEnumerator = connection.CreateDatabasePortal().GetVertices(vertexQuery);
+            this.verticesEnumerator = connection.CreateDatabasePortal().GetVerticesAndEdgesViaVertices(vertexQuery);
             //this.verticesViaExternalAPIEnumerator = connection.CreateDatabasePortal().GetVerticesViaExternalAPI(vertexViaExternalAPIQuery);
         }
 
         public override RawRecord Next()
         {
             if (/*this.connection.GraphType != GraphType.CompatibleOnly && */this.verticesEnumerator.MoveNext()) {
-                return this.verticesEnumerator.Current;
+                return this.verticesEnumerator.Current.Item2;
             }
 
             //if (this.connection.GraphType != GraphType.GraphAPIOnly && this.verticesViaExternalAPIEnumerator.MoveNext()) {
@@ -109,9 +109,42 @@ namespace GraphView
 
         public override void ResetState()
         {
-            this.verticesEnumerator = this.connection.CreateDatabasePortal().GetVertices(this.vertexQuery);
+            this.verticesEnumerator = this.connection.CreateDatabasePortal().GetVerticesAndEdgesViaVertices(this.vertexQuery);
             //this.verticesViaExternalAPIEnumerator = connection.CreateDatabasePortal().GetVerticesViaExternalAPI(this.vertexViaExternalAPIQuery);
             this.outputBuffer?.Clear();
+            this.Open();
+        }
+    }
+
+    internal class FetchEdgeOperator : GraphViewExecutionOperator
+    {
+        private JsonQuery edgeQuery;
+        private GraphViewConnection connection;
+
+        private IEnumerator<RawRecord> verticesAndEdgesEnumerator;
+
+        public FetchEdgeOperator(GraphViewConnection connection, JsonQuery edgeQuery)
+        {
+            this.Open();
+            this.connection = connection;
+            this.edgeQuery = edgeQuery;
+            this.verticesAndEdgesEnumerator = connection.CreateDatabasePortal().GetVerticesAndEdgesViaEdges(edgeQuery);
+        }
+
+        public override RawRecord Next()
+        {
+            if (this.verticesAndEdgesEnumerator.MoveNext())
+            {
+                return this.verticesAndEdgesEnumerator.Current;
+            }
+
+            this.Close();
+            return null;
+        }
+
+        public override void ResetState()
+        {
+            this.verticesAndEdgesEnumerator = this.connection.CreateDatabasePortal().GetVerticesAndEdgesViaEdges(this.edgeQuery);
             this.Open();
         }
     }
@@ -307,11 +340,11 @@ namespace GraphView
 
                     using (DbPortal databasePortal = this.connection.CreateDatabasePortal())
                     {
-                        IEnumerator<RawRecord> verticesEnumerator = databasePortal.GetVertices(toSendQuery);
+                        IEnumerator<Tuple<VertexField, RawRecord>> verticesEnumerator = databasePortal.GetVerticesAndEdgesViaVertices(toSendQuery);
 
                         // The following lines are added for debugging convenience
                         // It nearly does no harm to performance
-                        List<RawRecord> temp = new List<RawRecord>();
+                        List<Tuple<VertexField, RawRecord>> temp = new List<Tuple<VertexField, RawRecord>>();
                         while (verticesEnumerator.MoveNext()) {
                             temp.Add(verticesEnumerator.Current);
                         }
@@ -320,11 +353,13 @@ namespace GraphView
                         // Now no matter whether this graph is CompatibleOnly, we should construct the sink vertices
                         //
                         //if (this.connection.GraphType != GraphType.CompatibleOnly) {
-                        foreach (RawRecord rec in temp) {
-                            if (!sinkVertexCollection.ContainsKey(rec[0].ToValue)) {
-                                sinkVertexCollection.Add(rec[0].ToValue, new List<RawRecord>());
+                        foreach (Tuple<VertexField, RawRecord> tuple in temp)
+                        {
+                            VertexField vfield = tuple.Item1;
+                            if (!sinkVertexCollection.ContainsKey(vfield.VertexId)) {
+                                sinkVertexCollection.Add(vfield.VertexId, new List<RawRecord>());
                             }
-                            sinkVertexCollection[rec[0].ToValue].Add(rec);
+                            sinkVertexCollection[vfield.VertexId].Add(tuple.Item2);
                         }
                         //}
 
@@ -382,13 +417,8 @@ namespace GraphView
             }
 
             if (this.outputBuffer.Count == 0) {
-                if (!this.inputOp.State())
-                    this.Close();
-                return null;
-            }
-            else if (this.outputBuffer.Count == 1) {
                 this.Close();
-                return this.outputBuffer.Dequeue();
+                return null;
             }
             else {
                 return this.outputBuffer.Dequeue();
@@ -418,6 +448,7 @@ namespace GraphView
         public override RawRecord Next()
         {
             RawRecord rec;
+
             while (Input.State() && (rec = Input.Next()) != null)
             {
                 if (Func.Evaluate(rec))
@@ -426,7 +457,8 @@ namespace GraphView
                 }
             }
 
-            Close();
+
+            this.Close();
             return null;
         }
 
@@ -434,6 +466,74 @@ namespace GraphView
         {
             Input.ResetState();
             Open();
+        }
+    }
+
+    internal class FilterInBatchOperator : GraphViewExecutionOperator
+    {
+        private readonly GraphViewExecutionOperator input;
+        private readonly BooleanFunction func;
+        private readonly int batchSize;
+
+        private int index;
+        private List<RawRecord> inputBatch;
+        private HashSet<int> returnIndexes;
+
+        public FilterInBatchOperator(GraphViewExecutionOperator input, BooleanFunction func, int batchSize = 1000)
+        {
+            this.input = input;
+            this.func = func;
+            this.batchSize = batchSize;
+            this.index = 0;
+            this.inputBatch = new List<RawRecord>();
+            this.returnIndexes = new HashSet<int>();
+
+            this.Open();
+        }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                while (this.index < this.inputBatch.Count)
+                {
+                    RawRecord inputRecord = this.inputBatch[this.index];
+                    int inputIndex = this.index++;
+                    if (this.returnIndexes.Contains(inputIndex))
+                    {
+                        return inputRecord.GetRange(1, inputRecord.Length - 1);
+                    }
+                }
+
+                if (!this.input.State())
+                {
+                    this.Close();
+                    return null;
+                }
+
+                this.index = 0;
+                this.inputBatch.Clear();
+                RawRecord rec;
+                while (this.inputBatch.Count < this.batchSize && this.input.State() && (rec = this.input.Next()) != null)
+                {
+                    RawRecord inputRecord = new RawRecord();
+                    inputRecord.Append(new StringField(this.inputBatch.Count.ToString(), JsonDataType.Int));
+                    inputRecord.Append(rec);
+                    this.inputBatch.Add(inputRecord);
+                }
+
+                this.returnIndexes = this.func.EvaluateInBatch(this.inputBatch);
+            }
+
+            return null;
+        }
+
+        public override void ResetState()
+        {
+            this.input.ResetState();
+            this.inputBatch.Clear();
+            this.returnIndexes.Clear();
+            this.Open();
         }
     }
 
@@ -658,11 +758,11 @@ namespace GraphView
 
     internal class OrderOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator inputOp;
-        private List<RawRecord> inputBuffer;
-        private int returnIndex;
+        protected GraphViewExecutionOperator inputOp;
+        protected List<RawRecord> inputBuffer;
+        protected int returnIndex;
 
-        private List<Tuple<ScalarFunction, IComparer>> orderByElements;
+        protected List<Tuple<ScalarFunction, IComparer>> orderByElements;
 
         public OrderOperator(GraphViewExecutionOperator inputOp, List<Tuple<ScalarFunction, IComparer>> orderByElements)
         {
@@ -724,6 +824,92 @@ namespace GraphView
             this.returnIndex = 0;
 
             this.Open();
+        }
+    }
+
+    internal class OrderInBatchOperator : OrderOperator
+    {
+        private RawRecord firstRecordInGroup;
+
+        internal OrderInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            List<Tuple<ScalarFunction, IComparer>> orderByElements)
+            : base(inputOp, orderByElements)
+        {
+            this.inputBuffer = new List<RawRecord>();
+        }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                while (this.returnIndex < this.inputBuffer.Count)
+                {
+                    return this.inputBuffer[this.returnIndex++];
+                }
+                this.returnIndex = 0;
+                this.inputBuffer.Clear();
+
+                if (this.firstRecordInGroup == null && this.inputOp.State())
+                {
+                    this.firstRecordInGroup = this.inputOp.Next();
+                }
+
+                if (this.firstRecordInGroup == null)
+                {
+                    this.Close();
+                    return null;
+                }
+
+                this.inputBuffer.Add(this.firstRecordInGroup);
+                // Collect one group into the buffer
+                RawRecord rec = null;
+                while (this.inputOp.State() &&
+                       (rec = this.inputOp.Next()) != null &&
+                       rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+                {
+                    this.inputBuffer.Add(rec);
+                }
+
+                this.firstRecordInGroup = rec;
+
+                this.inputBuffer.Sort((x, y) =>
+                {
+                    int ret = 0;
+                    foreach (Tuple<ScalarFunction, IComparer> orderByElement in this.orderByElements)
+                    {
+                        ScalarFunction byFunction = orderByElement.Item1;
+
+                        FieldObject xKey = byFunction.Evaluate(x);
+                        if (xKey == null)
+                        {
+                            throw new GraphViewException("The provided traversal or property name of Order does not map to a value.");
+                        }
+
+                        FieldObject yKey = byFunction.Evaluate(y);
+                        if (yKey == null)
+                        {
+                            throw new GraphViewException("The provided traversal or property name of Order does not map to a value.");
+                        }
+
+                        IComparer comparer = orderByElement.Item2;
+                        ret = comparer.Compare(xKey.ToObject(), yKey.ToObject());
+
+                        if (ret != 0) break;
+                    }
+                    return ret;
+                });
+
+                continue;
+            }
+
+            return null;
+        }
+
+        public override void ResetState()
+        {
+            base.ResetState();
+            this.inputBuffer = new List<RawRecord>();
         }
     }
 
@@ -918,8 +1104,8 @@ namespace GraphView
 
     internal class ProjectAggregation : GraphViewExecutionOperator
     {
-        List<Tuple<IAggregateFunction, List<ScalarFunction>>> aggregationSpecs;
-        GraphViewExecutionOperator inputOp;
+        protected List<Tuple<IAggregateFunction, List<ScalarFunction>>> aggregationSpecs;
+        protected GraphViewExecutionOperator inputOp;
 
         public ProjectAggregation(GraphViewExecutionOperator inputOp)
         {
@@ -999,6 +1185,127 @@ namespace GraphView
             return outputRec;
         }
     }
+
+    internal class ProjectAggregationInBatch : ProjectAggregation
+    {
+        private RawRecord firstRecordInGroup = null;
+        private int processedGroupIndex;
+
+        internal ProjectAggregationInBatch(GraphViewExecutionOperator inputOp) : base(inputOp)
+        {
+            this.processedGroupIndex = 0;
+        }
+
+        public override RawRecord Next()
+        {
+            if (this.firstRecordInGroup == null && this.State())
+            {
+                this.firstRecordInGroup = this.inputOp.Next();
+            }
+
+            if (this.firstRecordInGroup == null)
+            {
+                this.Close();
+                return null;
+            }
+
+            while (this.processedGroupIndex < int.Parse(this.firstRecordInGroup[0].ToValue))
+            {
+                foreach (Tuple<IAggregateFunction, List<ScalarFunction>> aggr in this.aggregationSpecs)
+                {
+                    if (aggr.Item1 == null)
+                    {
+                       continue;
+                    }
+                    aggr.Item1.Init();
+                }
+
+                RawRecord noAccumulateRecord = new RawRecord();
+                noAccumulateRecord.Append(new StringField(this.processedGroupIndex.ToString(), JsonDataType.Int));
+                foreach (Tuple<IAggregateFunction, List<ScalarFunction>> aggr in this.aggregationSpecs)
+                {
+                    if (aggr.Item1 != null)
+                    {
+                        noAccumulateRecord.Append(aggr.Item1.Terminate());
+                    }
+                    else
+                    {
+                        noAccumulateRecord.Append((FieldObject)null);
+                    }
+                }
+                this.processedGroupIndex++;
+
+                return noAccumulateRecord;
+            }
+
+            foreach (Tuple<IAggregateFunction, List<ScalarFunction>> aggr in this.aggregationSpecs)
+            {
+                if (aggr.Item1 == null)
+                {
+                    continue;
+                }
+
+                aggr.Item1.Init();
+                FieldObject[] paraList = new FieldObject[aggr.Item2.Count];
+                for (int index = 0; index < aggr.Item2.Count; index++)
+                {
+                    paraList[index] = aggr.Item2[index].Evaluate(this.firstRecordInGroup);
+                }
+
+                aggr.Item1.Accumulate(paraList);
+            }
+
+            RawRecord rec = this.inputOp.Next();
+            while (rec != null && rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+            {
+                foreach (Tuple<IAggregateFunction, List<ScalarFunction>> aggr in this.aggregationSpecs)
+                {
+                    IAggregateFunction aggregate = aggr.Item1;
+
+                    if (aggregate == null)
+                    {
+                        continue;
+                    }
+
+                    FieldObject[] paraList = new FieldObject[aggr.Item2.Count];
+                    for (int index = 0; index < aggr.Item2.Count; index++)
+                    {
+                        paraList[index] = aggr.Item2[index].Evaluate(this.firstRecordInGroup);
+                    }
+
+                    aggr.Item1.Accumulate(paraList);
+                }
+
+                rec = this.inputOp.Next();
+            }
+
+            RawRecord outputRec = new RawRecord();
+            outputRec.Append(this.firstRecordInGroup[0]);
+            foreach (Tuple<IAggregateFunction, List<ScalarFunction>> aggr in this.aggregationSpecs)
+            {
+                if (aggr.Item1 != null)
+                {
+                    outputRec.Append(aggr.Item1.Terminate());
+                }
+                else
+                {
+                    outputRec.Append((FieldObject)null);
+                }
+            }
+
+            this.firstRecordInGroup = rec;
+            this.processedGroupIndex++;
+
+            return outputRec;
+        }
+
+        public override void ResetState()
+        {
+            this.processedGroupIndex = 0;
+            base.ResetState();
+        }
+    }
+
 
     internal class MapOperator : GraphViewExecutionOperator
     {
@@ -1125,6 +1432,87 @@ namespace GraphView
             Open();
         }
     }
+
+
+    internal class FlatMapInBatchOperator : GraphViewExecutionOperator
+    {
+        private GraphViewExecutionOperator inputOp;
+
+        // The traversal inside the flatMap function.
+        private GraphViewExecutionOperator flatMapTraversal;
+        private ContainerEnumerator sourceEnumerator;
+        
+        private List<RawRecord> inputBatch;
+
+        private int batchSize;
+
+        public FlatMapInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            GraphViewExecutionOperator flatMapTraversal,
+            ContainerEnumerator sourceEnumerator,
+            int batchSize = KW_DEFAULT_BATCH_SIZE)
+        {
+            this.inputOp = inputOp;
+            this.flatMapTraversal = flatMapTraversal;
+            this.sourceEnumerator = sourceEnumerator;
+            this.batchSize = batchSize;
+
+            this.inputBatch = new List<RawRecord>();
+
+            this.Open();
+        }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                if (this.inputBatch.Any())
+                {
+                    RawRecord subTraversalRecord;
+                    while (flatMapTraversal.State() && (subTraversalRecord = flatMapTraversal.Next()) != null)
+                    {
+                        int subTraversalRecordIndex = int.Parse(subTraversalRecord[0].ToValue);
+                        RawRecord resultRecord = inputBatch[subTraversalRecordIndex].GetRange(1);
+                        resultRecord.Append(subTraversalRecord.GetRange(1));
+                        return resultRecord;
+                    }
+                }
+                
+                this.inputBatch.Clear();
+                RawRecord inputRecord;
+                while (this.inputBatch.Count < this.batchSize && this.inputOp.State() && (inputRecord = inputOp.Next()) != null)
+                {
+                    RawRecord batchRawRecord = new RawRecord();
+                    batchRawRecord.Append(new StringField(this.inputBatch.Count.ToString(), JsonDataType.Int));
+                    batchRawRecord.Append(inputRecord);
+
+                    inputBatch.Add(batchRawRecord);
+                }
+
+                if (!inputBatch.Any())
+                {
+                    this.Close();
+                    return null;
+                }
+
+                sourceEnumerator.ResetTableCache(inputBatch);
+                flatMapTraversal.ResetState();
+            }
+
+            return null;
+        }
+
+        public override void ResetState()
+        {
+            this.sourceEnumerator.ResetState();
+            this.inputBatch.Clear();
+            this.inputOp.ResetState();
+            this.flatMapTraversal.ResetState();
+            this.Open();
+        }
+    }
+
+
 
     internal class LocalOperator : GraphViewExecutionOperator
     {
@@ -1365,6 +1753,287 @@ namespace GraphView
             Open();
         }
     }
+
+    internal class OptionalInBatchOperator : GraphViewExecutionOperator
+    {
+        private const int batchIdIndex = 0;
+
+        // A list of record fields (identified by field indexes) from the input 
+        // operator are to be returned when the optional traversal produces no results.
+        // When a field index is less than 0, it means that this field value is always null. 
+        private readonly List<int> inputIndexes;
+
+        private readonly GraphViewExecutionOperator inputOp;
+        ContainerEnumerator sourceEnumerator;
+
+        private readonly List<RawRecord> inputBuffer;
+        private const int inputBatchSize = 1000;
+        private readonly List<RawRecord> optionalResultBuffer;
+        private int inputOffset;
+        private bool newInput;
+        private int optionalOffset;
+
+        // The traversal inside the optional function. 
+        // The records returned by this operator should have the same number of fields
+        // as the records produced by the input operator, i.e., inputIndexes.Count 
+        private readonly GraphViewExecutionOperator optionalTraversal;
+
+        private readonly bool aggregateMode;
+        private readonly bool inputInBatch;
+        private readonly int inputRecordLength;
+
+        public OptionalInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            List<int> inputIndexes,
+            GraphViewExecutionOperator optionalTraversalOp,
+            ContainerEnumerator sourceEnumerator,
+            bool aggregateMode,
+            bool inputInBatch,
+            int inputRecordLength)
+        {
+            this.inputOp = inputOp;
+            this.inputIndexes = inputIndexes;
+            this.optionalTraversal = optionalTraversalOp;
+            this.sourceEnumerator = sourceEnumerator;
+            this.aggregateMode = aggregateMode;
+            this.inputInBatch = inputInBatch;
+
+            this.inputRecordLength = inputRecordLength;
+            this.inputBuffer = new List<RawRecord>();
+            this.optionalResultBuffer = new List<RawRecord>();
+            this.inputOffset = 0;
+            this.optionalOffset = 0;
+            this.newInput = true;
+
+            this.Open();
+        }
+
+        private RawRecord ConstructForwardingRecord(RawRecord inputRecord)
+        {
+            RawRecord rawRecord = new RawRecord(inputRecord);
+            foreach (int index in this.inputIndexes)
+            {
+                if (index < 0)
+                {
+                    rawRecord.Append((FieldObject)null);
+                }
+                else
+                {
+                    rawRecord.Append(inputRecord[index]);
+                }
+            }
+
+            return rawRecord;
+        }
+
+        public override RawRecord Next()
+        {
+            if (this.aggregateMode)
+            {
+                if (this.inputOp.State())
+                {
+                    RawRecord inputRec = null;
+                    while (this.inputOp.State() && (inputRec = this.inputOp.Next()) != null)
+                    {
+                        this.inputBuffer.Add(inputRec);
+                    }
+
+                    this.sourceEnumerator.ResetTableCache(this.inputBuffer);
+
+                    RawRecord optionalRecord = null;
+                    while (this.optionalTraversal.State() && (optionalRecord = this.optionalTraversal.Next()) != null)
+                    {
+                        this.optionalResultBuffer.Add(optionalRecord);
+                    }
+                }
+
+                if (this.inputInBatch && this.inputOffset < this.inputBuffer.Count)
+                {
+                    int outputBatchId = this.optionalOffset < this.optionalResultBuffer.Count
+                        ? int.Parse(this.optionalResultBuffer[this.optionalOffset][batchIdIndex].ToValue)
+                        : -1;
+
+                    if (outputBatchId < 0)
+                    {
+                        RawRecord result = this.ConstructForwardingRecord(this.inputBuffer[this.inputOffset]);
+                        this.inputOffset++;
+                        return result;
+                    }
+
+                    int inputBatchId = int.Parse(this.inputBuffer[this.inputOffset][batchIdIndex].ToValue);
+
+                    if (inputBatchId == outputBatchId)
+                    {
+                        RawRecord optionalRec = this.optionalResultBuffer[this.optionalOffset];
+
+                        RawRecord result = new RawRecord();
+                        result.Append(new StringField(inputBatchId.ToString(), JsonDataType.Int));
+                        for (int i = 1; i < this.inputRecordLength; i++)
+                        {
+                            result.Append((FieldObject)null);
+                        }
+                        result.Append(optionalRec.GetRange(1, optionalRec.Length - 1));
+
+                        this.optionalOffset++;
+
+                        // Fastforward to the next batch group
+                        while (++this.inputOffset < this.inputBuffer.Count)
+                        {
+                            inputBatchId = int.Parse(this.inputBuffer[this.inputOffset][batchIdIndex].ToValue);
+                            if (inputBatchId > outputBatchId)
+                            {
+                                break;
+                            }
+                        }
+
+                        return result;
+                    }
+                    else if (inputBatchId < outputBatchId)
+                    {
+                        RawRecord inputRec = this.inputBuffer[this.inputOffset];
+                        RawRecord result = this.ConstructForwardingRecord(inputRec);
+                        this.inputOffset++;
+                        return result;
+                    }
+                    else if (inputBatchId > outputBatchId)
+                    {
+                        RawRecord optionalRec = this.optionalResultBuffer[this.optionalOffset];
+                        RawRecord result = new RawRecord();
+                        result.Append(new StringField(outputBatchId.ToString(), JsonDataType.Int));
+                        for (int i = 1; i < this.inputRecordLength; i++)
+                        {
+                            result.Append((FieldObject)null);
+                        }
+                        result.Append(optionalRec.GetRange(1, optionalRec.Length - 1));
+                        this.optionalOffset++;
+                        return result;
+                    }
+                }
+                else
+                {
+                    if (this.optionalResultBuffer.Count > 0)
+                    {
+                        if (this.optionalOffset < this.optionalResultBuffer.Count)
+                        {
+                            RawRecord result = new RawRecord();
+                            for (int i = 0; i < this.inputRecordLength; i++)
+                            {
+                                result.Append((FieldObject)null);
+                            } 
+                            result.Append(this.optionalResultBuffer[this.optionalOffset]);
+                            this.optionalOffset++;
+                            return result;
+                        }
+                    }
+                    else
+                    {
+                        if (this.inputOffset < this.inputBuffer.Count)
+                        {
+                            RawRecord inputRec = this.inputBuffer[this.inputOffset];
+                            RawRecord result = this.ConstructForwardingRecord(inputRec);
+                            this.inputOffset++;
+                            return result;
+                        }
+                    }
+                }
+
+                this.Close();
+                return null;
+            }
+            else
+            {
+                while (this.State())
+                {
+                    if (this.inputOffset >= this.inputBuffer.Count)
+                    {
+                        this.inputBuffer.Clear();
+                        this.inputOffset = 0;
+                        this.newInput = true;
+                        this.optionalResultBuffer.Clear();
+                        this.optionalOffset = 0;
+
+                        RawRecord inputRec = null;
+                        while (this.inputOp.State() &&
+                            (inputRec = this.inputOp.Next()) != null &&
+                            this.inputBuffer.Count < inputBatchSize)
+                        {
+                            RawRecord batchedRecord = new RawRecord();
+                            batchedRecord.Append(new StringField(this.inputBuffer.Count.ToString(), JsonDataType.Int));
+                            batchedRecord.Append(inputRec);
+                            this.inputBuffer.Add(batchedRecord);
+                        }
+
+                        this.sourceEnumerator.ResetTableCache(this.inputBuffer);
+                        this.optionalTraversal.ResetState();
+
+                        RawRecord optionalRecord;
+                        while (this.optionalTraversal.State() && (optionalRecord = this.optionalTraversal.Next()) != null)
+                        {
+                            this.optionalResultBuffer.Add(optionalRecord);
+                        }
+                    }
+
+                    if (this.inputOffset >= this.inputBuffer.Count)
+                    {
+                        this.Close();
+                        return null;
+                    }
+
+                    int inputBatchId = int.Parse(this.inputBuffer[this.inputOffset][batchIdIndex].ToValue);
+                    int outputBatchId = this.optionalOffset < this.optionalResultBuffer.Count
+                            ? int.Parse(this.optionalResultBuffer[this.optionalOffset][batchIdIndex].ToValue)
+                            : -1;
+
+                    if (inputBatchId == outputBatchId)
+                    {
+                        RawRecord inputRec = this.inputBuffer[this.inputOffset];
+                        RawRecord optionalRec = this.optionalResultBuffer[this.optionalOffset];
+                        RawRecord resultRec = inputRec.GetRange(1, inputRec.Length - 1);
+                        resultRec.Append(optionalRec.GetRange(1, optionalRec.Length - 1));
+
+                        this.optionalOffset++;
+                        this.newInput = false;
+
+                        return resultRec;
+                    }
+                    else
+                    {
+                        if (this.newInput)
+                        {
+                            RawRecord inputRec = this.inputBuffer[this.inputOffset];
+                            RawRecord resultRec = this.ConstructForwardingRecord(inputRec.GetRange(1, inputRec.Length - 1));
+                            this.inputOffset++;
+                            this.newInput = true;
+
+                            return resultRec;
+                        }
+                        else
+                        {
+                            this.inputOffset++;
+                            this.newInput = true;
+                            continue;
+                        }
+                    }
+                }
+
+                return null;
+            }
+        }
+
+        public override void ResetState()
+        {
+            this.inputOp.ResetState();
+            this.sourceEnumerator.ResetState();
+            this.optionalTraversal.ResetState();
+            this.inputBuffer.Clear();
+            this.optionalResultBuffer.Clear();
+            this.inputOffset = 0;
+            this.optionalOffset = 0;
+            this.newInput = true;
+            this.Open();
+        }
+    }
+
 
     internal class UnionOperator : GraphViewExecutionOperator
     {
@@ -1778,9 +2447,9 @@ namespace GraphView
 
     internal class DeduplicateOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator inputOp;
-        private HashSet<CollectionField> compositeDedupKeySet;
-        private List<ScalarFunction> compositeDedupKeyFuncList;
+        protected GraphViewExecutionOperator inputOp;
+        protected HashSet<CollectionField> compositeDedupKeySet;
+        protected List<ScalarFunction> compositeDedupKeyFuncList;
 
         internal DeduplicateOperator(GraphViewExecutionOperator inputOperator, List<ScalarFunction> compositeDedupKeyFuncList)
         {
@@ -1828,6 +2497,92 @@ namespace GraphView
             this.compositeDedupKeySet.Clear();
 
             this.Open();
+        }
+    }
+
+    internal class DeduplicateInBatchOperator : DeduplicateOperator
+    {
+        private RawRecord firstRecordInGroup;
+        private bool newGroup;
+
+        internal DeduplicateInBatchOperator(
+            GraphViewExecutionOperator inputOperator,
+            List<ScalarFunction> compositeDedupKeyFuncList)
+            : base(inputOperator, compositeDedupKeyFuncList)
+        {
+            this.newGroup = false;
+        }
+
+        private bool IsUniqueRecord(RawRecord record)
+        {
+            List<FieldObject> keys = new List<FieldObject>();
+            foreach (ScalarFunction getDedupKeyFunc in this.compositeDedupKeyFuncList)
+            {
+                FieldObject key = getDedupKeyFunc.Evaluate(record);
+                if (key == null)
+                {
+                    throw new GraphViewException("The provided traversal or property name of Dedup does not map to a value.");
+                }
+
+                keys.Add(key);
+            }
+
+            CollectionField compositeDedupKey = new CollectionField(keys);
+
+            if (!this.compositeDedupKeySet.Contains(compositeDedupKey))
+            {
+                this.compositeDedupKeySet.Add(compositeDedupKey);
+                return true;
+            }
+
+            return false;
+        }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                RawRecord rec = null;
+                while (this.newGroup &&
+                    this.inputOp.State() &&
+                    (rec = this.inputOp.Next()) != null &&
+                    rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+                {
+                    if (this.IsUniqueRecord(rec))
+                    {
+                        return rec;
+                    }
+                }
+
+                this.newGroup = false;
+                this.firstRecordInGroup = rec;
+                this.compositeDedupKeySet.Clear();
+
+                if (this.firstRecordInGroup == null && this.inputOp.State())
+                {
+                    this.firstRecordInGroup = this.inputOp.Next();
+                }
+
+                if (this.firstRecordInGroup == null)
+                {
+                    this.Close();
+                    return null;
+                }
+
+                this.newGroup = true;
+                if (this.IsUniqueRecord(this.firstRecordInGroup))
+                {
+                    return this.firstRecordInGroup;
+                }
+            }
+
+            return null;
+        }
+
+        public override void ResetState()
+        {
+            base.ResetState();
+            this.newGroup = false;
         }
     }
 
@@ -1907,13 +2662,13 @@ namespace GraphView
 
     internal class RangeOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator inputOp;
-        private int startIndex;
+        protected GraphViewExecutionOperator inputOp;
+        protected int startIndex;
         //
         // if count is -1, return all the records starting from startIndex
         //
-        private int highEnd;
-        private int index;
+        protected int highEnd;
+        protected int index;
 
         internal RangeOperator(GraphViewExecutionOperator inputOp, int startIndex, int count)
         {
@@ -1952,6 +2707,71 @@ namespace GraphView
             this.inputOp.ResetState();
             this.index = 0;
             this.Open();
+        }
+    }
+
+    internal class RangeInBatchOperator : RangeOperator
+    {
+        private RawRecord firstRecordInGroup;
+
+        internal RangeInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            int startIndex,
+            int count)
+            : base(inputOp, startIndex, count) { }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                if (this.firstRecordInGroup == null && this.inputOp.State())
+                {
+                    this.firstRecordInGroup = this.inputOp.Next();
+                }
+
+                if (this.firstRecordInGroup == null)
+                {
+                    this.Close();
+                    return null;
+                }
+
+                // First record in the group
+                if (this.index == 0)
+                {
+                    if (this.startIndex == 0)
+                    {
+                        this.index++;
+                        return this.firstRecordInGroup;
+                    }
+                    else
+                    {
+                        this.index++;
+                    }
+                }
+
+                RawRecord rec = null;
+                // Return a record within [startIndex, highEnd) in the group
+                while (this.inputOp.State() &&
+                    (rec = this.inputOp.Next()) != null &&
+                    rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+                {
+                    if (this.index < this.startIndex || (this.highEnd != -1 && this.index >= this.highEnd))
+                    {
+                        this.index++;
+                        continue;
+                    }
+
+                    this.index++;
+                    return rec;
+                }
+
+                // Passes the current group. Reaches a new group. Resets the index.
+                this.firstRecordInGroup = rec;
+                this.index = 0;
+                continue;
+            }
+
+            return null;
         }
     }
 
@@ -2085,10 +2905,10 @@ namespace GraphView
 
     internal class TailOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator inputOp;
-        private int lastN;
-        private int count;
-        private List<RawRecord> buffer; 
+        protected GraphViewExecutionOperator inputOp;
+        protected int lastN;
+        protected int count;
+        protected List<RawRecord> buffer; 
 
         internal TailOperator(GraphViewExecutionOperator inputOp, int lastN)
         {
@@ -2129,6 +2949,57 @@ namespace GraphView
             this.count = 0;
             this.buffer.Clear();
             this.Open();
+        }
+    }
+
+    internal class TailInBatchOperator : TailOperator
+    {
+        private RawRecord firstRecordInGroup;
+
+        internal TailInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            int lastN)
+            : base(inputOp, lastN) { }
+
+        public override RawRecord Next()
+        {
+            while (this.State())
+            {
+                int startIndex = this.buffer.Count < this.lastN ? 0 : this.buffer.Count - this.lastN;
+                int index = startIndex + this.count++;
+                while (index < this.buffer.Count)
+                {
+                    return this.buffer[index];
+                }
+                this.count = 0;
+                this.buffer.Clear();
+
+                if (this.firstRecordInGroup == null && this.inputOp.State())
+                {
+                    this.firstRecordInGroup = this.inputOp.Next();
+                }
+
+                if (this.firstRecordInGroup == null)
+                {
+                    this.Close();
+                    return null;
+                }
+
+                this.buffer.Add(this.firstRecordInGroup);
+                // Collect one group into the buffer
+                RawRecord rec = null;
+                while (this.inputOp.State() &&
+                       (rec = this.inputOp.Next()) != null &&
+                       rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+                {
+                    this.buffer.Add(rec);
+                }
+
+                this.firstRecordInGroup = rec;
+                continue;
+            }
+
+            return null;
         }
     }
 
@@ -2569,66 +3440,56 @@ namespace GraphView
 
     internal class ProjectByOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator _inputOp;
-        private List<Tuple<ConstantSourceOperator, GraphViewExecutionOperator, string>> _projectList;
+        private GraphViewExecutionOperator inputOp;
+        private List<Tuple<string, ScalarFunction>> projectList;
 
         internal ProjectByOperator(GraphViewExecutionOperator pInputOperator)
         {
-            _inputOp = pInputOperator;
-            _projectList = new List<Tuple<ConstantSourceOperator, GraphViewExecutionOperator, string>>();
-            Open();
+            this.inputOp = pInputOperator;
+            this.projectList = new List<Tuple<string, ScalarFunction>>();
+            this.Open();
         }
 
-        public void AddProjectBy(ConstantSourceOperator contextOp, GraphViewExecutionOperator traversal, string key)
+        public void AddProjectBy(string key, ScalarFunction byFunction)
         {
-            _projectList.Add(new Tuple<ConstantSourceOperator, GraphViewExecutionOperator, string>(contextOp, traversal, key));
+            this.projectList.Add(new Tuple<string, ScalarFunction>(key, byFunction));
         }
 
         public override RawRecord Next()
         {
             RawRecord currentRecord;
 
-            while (_inputOp.State() && (currentRecord = _inputOp.Next()) != null)
+            while (this.inputOp.State() && (currentRecord = this.inputOp.Next()) != null)
             {
                 MapField projectMap = new MapField();
-                RawRecord extraRecord = new RawRecord();
 
-                foreach (var tuple in _projectList)
+                foreach (Tuple<string, ScalarFunction> tuple in this.projectList)
                 {
-                    string projectKey = tuple.Item3;
-                    ConstantSourceOperator projectContext = tuple.Item1;
-                    GraphViewExecutionOperator projectTraversal = tuple.Item2;
-                    projectContext.ConstantSource = currentRecord;
-                    projectTraversal.ResetState();
+                    string projectKey = tuple.Item1;
+                    ScalarFunction byFunction = tuple.Item2;
+                    FieldObject projectValue = byFunction.Evaluate(currentRecord);
 
-                    RawRecord projectRec = projectTraversal.Next();
-                    projectTraversal.Close();
-
-                    if (projectRec == null)
+                    if (projectValue == null)
                         throw new GraphViewException(
-                            string.Format("The provided traverser of key \"{0}\" does not map to a value.", projectKey));
+                            $"The provided traverser of key \"{projectKey}\" does not map to a value.");
 
-                    projectMap.Add(new StringField(projectKey), projectRec.RetriveData(0));
-                    for (var i = 1; i < projectRec.Length; i++)
-                        extraRecord.Append(projectRec[i]);
+                    projectMap.Add(new StringField(projectKey), projectValue);
                 }
 
-                var result = new RawRecord(currentRecord);
+                RawRecord result = new RawRecord(currentRecord);
                 result.Append(projectMap);
-                if (extraRecord.Length > 0)
-                    result.Append(extraRecord);
 
                 return result;
             }
 
-            Close();
+            this.Close();
             return null;
         }
 
         public override void ResetState()
         {
-            _inputOp.ResetState();
-            Open();
+            this.inputOp.ResetState();
+            this.Open();
         }
     }
 
@@ -2713,36 +3574,108 @@ namespace GraphView
 
     internal class QueryDerivedTableOperator : GraphViewExecutionOperator
     {
-        private GraphViewExecutionOperator _queryOp;
-        private ContainerOperator _rootContainerOp;
+        protected GraphViewExecutionOperator inputOp;
+        protected GraphViewExecutionOperator derivedQueryOp;
+        protected ContainerEnumerator sourceEnumerator;
+        protected List<RawRecord> inputRecords;
 
-        public QueryDerivedTableOperator(GraphViewExecutionOperator queryOp, ContainerOperator containerOp)
+        protected int carryOnCount;
+
+        public QueryDerivedTableOperator(
+            GraphViewExecutionOperator inputOp, 
+            GraphViewExecutionOperator derivedQueryOp,
+            ContainerEnumerator sourceEnumerator, 
+            int carryOnCount)
         {
-            _queryOp = queryOp;
-            _rootContainerOp = containerOp;
+            this.inputOp = inputOp;
+            this.derivedQueryOp = derivedQueryOp;
+            this.inputRecords = new List<RawRecord>();
+            this.sourceEnumerator = sourceEnumerator;
+            this.carryOnCount = carryOnCount;
 
-            Open();
+            this.Open();
         }
 
         public override RawRecord Next()
         {
-            RawRecord derivedRecord;
-
-            while (_queryOp.State() && (derivedRecord = _queryOp.Next()) != null)
+            if (this.inputOp != null && this.inputOp.State())
             {
-                return derivedRecord;
+                RawRecord inputRec;
+                while (this.inputOp.State() && (inputRec = this.inputOp.Next()) != null)
+                {
+                    this.inputRecords.Add(inputRec);
+                }
+
+                this.sourceEnumerator.ResetTableCache(this.inputRecords);
             }
 
-            Close();
+            RawRecord derivedRecord;
+            while (this.derivedQueryOp.State() && (derivedRecord = this.derivedQueryOp.Next()) != null)
+            {
+                RawRecord returnRecord = new RawRecord();
+                for (int i = 0; i < this.carryOnCount; i++)
+                {
+                    returnRecord.Append((FieldObject)null);
+                }
+
+                returnRecord.Append(derivedRecord);
+                return returnRecord;
+            }
+
+            this.Close();
             return null;
         }
 
         public override void ResetState()
         {
-            _queryOp.ResetState();
-            _rootContainerOp?.ResetState();
+            this.inputOp?.ResetState();
+            this.derivedQueryOp.ResetState();
+            this.inputRecords.Clear();
+            this.sourceEnumerator.ResetState();
 
-            Open();
+            this.Open();
+        }
+    }
+
+    internal class QueryDerivedInBatchOperator : QueryDerivedTableOperator
+    {
+        public QueryDerivedInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            GraphViewExecutionOperator derivedQueryOp,
+            ContainerEnumerator sourceEnumerator,
+            int carryOnCount)
+            : base(inputOp, derivedQueryOp, sourceEnumerator, carryOnCount)
+        { }
+
+        public override RawRecord Next()
+        {
+            if (this.inputOp != null && this.inputOp.State())
+            {
+                RawRecord inputRec;
+                while (this.inputOp.State() && (inputRec = this.inputOp.Next()) != null)
+                {
+                    this.inputRecords.Add(inputRec);
+                }
+
+                this.sourceEnumerator.ResetTableCache(this.inputRecords);
+            }
+
+            RawRecord derivedRecord;
+            while (this.derivedQueryOp.State() && (derivedRecord = this.derivedQueryOp.Next()) != null)
+            {
+                RawRecord returnRecord = new RawRecord();
+                returnRecord.Append(derivedRecord[0]);
+                for (int i = 1; i < this.carryOnCount; i++)
+                {
+                    returnRecord.Append((FieldObject)null);
+                }
+                returnRecord.Append(derivedRecord.GetRange(1, derivedRecord.Length - 1));
+
+                return returnRecord;
+            }
+
+            this.Close();
+            return null;
         }
     }
 
@@ -3444,64 +4377,65 @@ namespace GraphView
 
     internal class SampleOperator : GraphViewExecutionOperator
     {
-        private readonly GraphViewExecutionOperator _inputOp;
-        private readonly long _amountToSample;
-        private readonly ScalarFunction _byFunction;  // Can be null if no "by" step
-        private readonly Random _random;
+        protected readonly GraphViewExecutionOperator inputOp;
+        protected readonly long amountToSample;
+        protected readonly ScalarFunction byFunction;  // Can be null if no "by" step
+        protected readonly Random random;
 
-        private readonly List<RawRecord> _inputRecords;
-        private readonly List<double> _inputProperties;
-        private int _nextIndex;
+        protected readonly List<RawRecord> inputRecords;
+        protected readonly List<double> inputProperties;
+        protected int nextIndex;
 
         public SampleOperator(
             GraphViewExecutionOperator inputOp,
             long amoutToSample,
             ScalarFunction byFunction)
         {
-            this._inputOp = inputOp;
-            this._amountToSample = amoutToSample;
-            this._byFunction = byFunction;  // Can be null if no "by" step
-            this._random = new Random();
+            this.inputOp = inputOp;
+            this.amountToSample = amoutToSample;
+            this.byFunction = byFunction;  // Can be null if no "by" step
+            this.random = new Random();
 
-            this._inputRecords = new List<RawRecord>();
-            this._inputProperties = new List<double>();
-            this._nextIndex = 0;
+            this.inputRecords = new List<RawRecord>();
+            this.inputProperties = new List<double>();
+            this.nextIndex = 0;
             Open();
         }
 
         public override RawRecord Next()
         {
-            if (this._nextIndex == 0) {
-                while (this._inputOp.State()) {
-                    RawRecord current = this._inputOp.Next();
+            if (this.nextIndex == 0) {
+                while (this.inputOp.State()) {
+                    RawRecord current = this.inputOp.Next();
                     if (current == null) break;
 
-                    this._inputRecords.Add(current);
-                    if (this._byFunction != null) {
-                        this._inputProperties.Add(double.Parse(this._byFunction.Evaluate(current).ToValue));
+                    this.inputRecords.Add(current);
+                    if (this.byFunction != null) {
+                        this.inputProperties.Add(double.Parse(this.byFunction.Evaluate(current).ToValue));
                     }
                 }
             }
 
             // Return nothing if sample amount <= 0
-            if (this._amountToSample <= 0) {
+            if (this.amountToSample <= 0) {
                 Close();
                 return null;
             }
 
             // Return all if sample amount > amount of inputs
-            if (this._amountToSample >= this._inputRecords.Count) {
-                if (this._nextIndex == this._inputRecords.Count - 1) {
-                    Close();
+            if (this.amountToSample >= this.inputRecords.Count) {
+                if (this.nextIndex == this.inputRecords.Count) {
+                    this.Close();
+                    return null;
                 }
-                return this._inputRecords[this._nextIndex++];
+                return this.inputRecords[this.nextIndex++];
             }
 
             // Sample!
-            if (this._nextIndex < this._amountToSample) {
+            if (this.nextIndex < this.amountToSample) {
                 
                 // TODO: Implement the sampling algorithm!
-                return this._inputRecords[this._nextIndex++];
+                return this.inputRecords[this.nextIndex++];
             }
 
             Close();
@@ -3510,12 +4444,93 @@ namespace GraphView
 
         public override void ResetState()
         {
-            this._inputOp.ResetState();
+            this.inputOp.ResetState();
 
-            this._inputRecords.Clear();
-            this._inputProperties.Clear();
-            this._nextIndex = 0;
+            this.inputRecords.Clear();
+            this.inputProperties.Clear();
+            this.nextIndex = 0;
             Open();
+        }
+    }
+
+    internal class SampleInBatchOperator : SampleOperator
+    {
+        private RawRecord firstRecordInGroup;
+
+        internal SampleInBatchOperator(
+            GraphViewExecutionOperator inputOp,
+            long amountToSample,
+            ScalarFunction byFunction)
+            : base(inputOp, amountToSample, byFunction) { }
+
+        public override RawRecord Next()
+        {
+            // Return nothing if sample amount <= 0
+            if (this.amountToSample <= 0)
+            {
+                this.Close();
+                return null;
+            }
+
+            while (this.State())
+            {
+                if (this.inputRecords.Any())
+                {
+                    // Return all if sample amount > amount of inputs
+                    if (this.amountToSample >= this.inputRecords.Count)
+                    {
+                        while (this.nextIndex < this.inputRecords.Count)
+                        {
+                            return this.inputRecords[this.nextIndex++];
+                        }
+                    }
+                    // Sample!
+                    else if (this.nextIndex < this.amountToSample)
+                    {
+                        // TODO: Implement the sampling algorithm!
+                        return this.inputRecords[this.nextIndex++];
+                    }
+                }
+
+                this.nextIndex = 0;
+                this.inputRecords.Clear();
+                this.inputProperties.Clear();
+
+                if (this.firstRecordInGroup == null && this.inputOp.State())
+                {
+                    this.firstRecordInGroup = this.inputOp.Next();
+                }
+
+                if (this.firstRecordInGroup == null)
+                {
+                    this.Close();
+                    return null;
+                }
+
+                this.inputRecords.Add(this.firstRecordInGroup);
+                if (this.byFunction != null)
+                {
+                    this.inputProperties.Add(double.Parse(this.byFunction.Evaluate(this.firstRecordInGroup).ToValue));
+                }
+
+                RawRecord rec = null;
+                while (this.inputOp.State() &&
+                    (rec = this.inputOp.Next()) != null &&
+                    rec[0].ToValue == this.firstRecordInGroup[0].ToValue)
+                {
+                    this.inputRecords.Add(this.firstRecordInGroup);
+                    if (this.byFunction != null)
+                    {
+                        this.inputProperties.Add(double.Parse(this.byFunction.Evaluate(this.firstRecordInGroup).ToValue));
+                    }
+                }
+
+                // Passes the current group. Reaches a new group. Resets the index.
+                this.firstRecordInGroup = rec;
+                continue;
+            }
+
+            return null;
         }
     }
 
@@ -3584,6 +4599,7 @@ namespace GraphView
     {
         private readonly GraphViewExecutionOperator inputOp;
         private readonly int inputTargetIndex;
+        private readonly List<string> populateColumns;
 
         //
         // true, select(keys)
@@ -3594,11 +4610,13 @@ namespace GraphView
         public SelectColumnOperator(
             GraphViewExecutionOperator inputOp,
             int inputTargetIndex,
-            bool isSelectKeys)
+            bool isSelectKeys,
+            List<string> populateColumns)
         {
             this.inputOp = inputOp;
             this.inputTargetIndex = inputTargetIndex;
             this.isSelectKeys = isSelectKeys;
+            this.populateColumns = populateColumns;
 
             this.Open();
         }
@@ -3620,13 +4638,28 @@ namespace GraphView
                         columns.Add(this.isSelectKeys ? entry.Key : entry.Value);
                     }
 
-                    r.Append(new CollectionField(columns));
+                    foreach (string rawRecordColumnName in this.populateColumns)
+                    {
+                        if (rawRecordColumnName.Equals(GremlinKeyword.TableDefaultColumnName))
+                        {
+                            r.Append(new CollectionField(columns));
+                        }
+                        else
+                        {
+                            r.Append((FieldObject)null);
+                        }
+                    }
+
                     return r;
                 }
                 else if (selectObj is EntryField)
                 {
                     EntryField inputEntry = (EntryField) selectObj;
-                    r.Append(this.isSelectKeys ? inputEntry.Key : inputEntry.Value);
+                    CompositeField result = (CompositeField)(this.isSelectKeys ? inputEntry.Key : inputEntry.Value);
+                    foreach (string rawRecordColumnName in this.populateColumns)
+                    {
+                        r.Append(result[rawRecordColumnName]);
+                    }
                     return r;
                 }
                 else if (selectObj is PathField)
@@ -3648,7 +4681,18 @@ namespace GraphView
                         }
                     }
 
-                    r.Append(new CollectionField(columns));
+                    foreach (string rawRecordColumnName in this.populateColumns)
+                    {
+                        if (rawRecordColumnName.Equals(GremlinKeyword.TableDefaultColumnName))
+                        {
+                            r.Append(new CollectionField(columns));
+                        }
+                        else
+                        {
+                            r.Append((FieldObject)null);
+                        }
+                    }
+
                     return r;
                 }
                 throw new GraphViewException(string.Format("The provided object does not have acessible {0}.",
@@ -4106,6 +5150,8 @@ namespace GraphView
         {
             HashSet<string> vertexIdCollection = new HashSet<string>();
             HashSet<string> vertexPartitionKeyCollection = new HashSet<string>();
+            EdgeType edgeType = 0;
+
             foreach (Tuple<RawRecord, string> tuple in this.lazyAdjacencyListBatch) {
                 string vertexId = tuple.Item2;
                 VertexField vertexField = (VertexField)(tuple.Item1[this.startVertexIndex]);
@@ -4114,18 +5160,31 @@ namespace GraphView
                 AdjacencyListField revAdj = vertexField.RevAdjacencyList;
                 Debug.Assert(adj != null, "adj != null");
                 Debug.Assert(revAdj != null, "revAdj != null");
-                if (adj.HasBeenFetched && revAdj.HasBeenFetched) {
-                    continue;
+
+                bool addThisEdge = false;
+                if (this.crossApplyForwardAdjacencyList && !adj.HasBeenFetched) {
+                    edgeType |= EdgeType.Outgoing;
+                    addThisEdge = true;
+                }
+                if (this.crossApplyBackwardAdjacencyList && !revAdj.HasBeenFetched) {
+                    edgeType |= EdgeType.Incoming;
+                    addThisEdge = true;
                 }
 
-                vertexIdCollection.Add(vertexId);
-                if (vertexField.Partition != null) {
-                    vertexPartitionKeyCollection.Add(vertexField.Partition);
+                if (addThisEdge) {
+                    vertexIdCollection.Add(vertexId);
+                    if (vertexField.Partition != null) {
+                        vertexPartitionKeyCollection.Add(vertexField.Partition);
+                    }
                 }
             }
 
-            EdgeDocumentHelper.ConstructLazyAdjacencyList(this.connection, vertexIdCollection, vertexPartitionKeyCollection);
+            if (vertexIdCollection.Count > 0) {
+                Debug.Assert(edgeType != 0);
+                EdgeDocumentHelper.ConstructLazyAdjacencyList(this.connection, edgeType, vertexIdCollection, vertexPartitionKeyCollection);
+            }
         }
+
 
         public override RawRecord Next()
         {

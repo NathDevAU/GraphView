@@ -246,7 +246,7 @@ namespace GraphView
             VertexSinglePropertyField vsp = (VertexSinglePropertyField)metaProperty.Parent;
             VertexField vertex = vsp.VertexProperty.Vertex;
             if (!vertex.ViaGraphAPI) {
-                Debug.Assert(vertex.VertexJObject[vsp.PropertyName] is JObject);
+                Debug.Assert(vertex.VertexJObject[vsp.PropertyName] is JArray);
                 ////throw new GraphViewException("BUG: Compatible vertices should not have meta properties.");
             }
 #endif
@@ -264,7 +264,12 @@ namespace GraphView
 
             JObject metaPropertyJObject = (JObject) propertyJToken?[KW_PROPERTY_META];
 
-            metaPropertyJObject?.Property(metaProperty.PropertyName)?.Remove();
+            if (metaPropertyJObject != null) {
+                metaPropertyJObject.Property(metaProperty.PropertyName)?.Remove();
+                if (metaPropertyJObject.Count == 0) {
+                    ((JObject)propertyJToken).Remove(KW_PROPERTY_META);
+                }
+            }
 
             // Update DocDB
             this.Connection.ReplaceOrDeleteDocumentAsync(vertexField.VertexId, vertexObject, 
@@ -408,8 +413,10 @@ namespace GraphView
                 JObject singleProperty = new JObject {
                     [KW_PROPERTY_VALUE] = property.Value.ToJValue(),
                     [KW_PROPERTY_ID] = GraphViewConnection.GenerateDocumentId(),
-                    [KW_PROPERTY_META] = meta,
                 };
+                if (meta.Count > 0) {
+                    singleProperty[KW_PROPERTY_META] = meta;
+                }
 
                 // Set / Append to multiProperty
                 JArray multiProperty;
@@ -477,6 +484,11 @@ namespace GraphView
             JObject singleProperty = (JObject)((JArray)vertexDocument[vp.PropertyName])
                 .First(single => (string) single[KW_PROPERTY_ID] == vp.PropertyId);
             JObject meta = (JObject)singleProperty[KW_PROPERTY_META];
+
+            if (meta == null && this.updateProperties.Count > 0) {
+                meta = new JObject();
+                singleProperty[KW_PROPERTY_META] = meta;
+            }
 
             foreach (WPropertyExpression property in this.updateProperties) {
                 if (property.Cardinality == GremlinKeyword.PropertyCardinality.List ||
@@ -1008,12 +1020,25 @@ namespace GraphView
 
             string sinkVertexId = (string)outEdgeObject[KW_EDGE_SINKV];
             string sinkVertexPartition = outEdgeObject[KW_EDGE_SINKV_PARTITION].ToObject<string>();
-            VertexField sinkVertexField = this.Connection.VertexCache.GetVertexField(sinkVertexId, sinkVertexPartition);
-            JObject sinkVertexObject = sinkVertexField.VertexJObject;
+            VertexField sinkVertexField;
+            JObject sinkVertexObject;
+            bool foundSink;
+            if (this.Connection.UseReverseEdges) {
+                sinkVertexField = this.Connection.VertexCache.GetVertexField(sinkVertexId, sinkVertexPartition);
+                sinkVertexObject = sinkVertexField.VertexJObject;
+                foundSink = true;
+            }
+            else {
+                foundSink = this.Connection.VertexCache.TryGetVertexField(sinkVertexId, out sinkVertexField);
+                sinkVertexObject = sinkVertexField?.VertexJObject;
+            }
+
             string inEdgeDocId = null;
             JObject inEdgeObject = null;
 
             if (this.Connection.UseReverseEdges) {
+                Debug.Assert(foundSink);
+
                 if (sinkVertexId.Equals(srcVertexId)) {
                     Debug.Assert(object.ReferenceEquals(sinkVertexField, srcVertexField));
                     Debug.Assert(object.ReferenceEquals(sinkVertexObject, srcVertexObject));
@@ -1024,8 +1049,13 @@ namespace GraphView
                     out inEdgeObject, out inEdgeDocId);
             }
 
-            EdgeField outEdgeField = srcVertexField.AdjacencyList.GetEdgeField(edgeId);
-            EdgeField inEdgeField = sinkVertexField.RevAdjacencyList.GetEdgeField(edgeId);
+            EdgeField outEdgeField = srcVertexField.AdjacencyList.GetEdgeField(edgeId, true);
+
+            // `inEdgeField` can be null in two cases:
+            //   - `sinkVertexField` is null
+            //   - `sinkVertexField` is in VertexCache, but its rev-edges are stilled lazy.
+            // NOTE: if UseReverseEdge is true, we have to fetch rev-edge to update its property.
+            EdgeField inEdgeField = sinkVertexField?.RevAdjacencyList.GetEdgeField(edgeId, false);
 
             // Drop all non-reserved properties
             if (this.PropertiesToBeUpdated.Count == 1 &&
@@ -1034,17 +1064,7 @@ namespace GraphView
                 !this.PropertiesToBeUpdated[0].Item2.SingleQuoted &&
                 this.PropertiesToBeUpdated[0].Item2.Value.Equals("null", StringComparison.OrdinalIgnoreCase))
             {
-                List<string> toBeDroppedProperties = GraphViewJsonCommand.DropAllEdgeProperties(outEdgeObject);
-                foreach (var propertyName in toBeDroppedProperties) {
-                    outEdgeField.EdgeProperties.Remove(propertyName);
-                }
-
-                if (this.Connection.UseReverseEdges) {
-                    toBeDroppedProperties = GraphViewJsonCommand.DropAllEdgeProperties(inEdgeObject);
-                }
-                foreach (var propertyName in toBeDroppedProperties) {
-                    inEdgeField.EdgeProperties.Remove(propertyName);
-                }
+                throw new Exception("BUG: This condition is obsolete. Code should not reach here now!");
             }
             else
             {
@@ -1061,21 +1081,24 @@ namespace GraphView
                         if (updatedProperty == null)
                             outEdgeField.EdgeProperties.Remove(keyExpression.Value);
                         else
-                            outEdgeField.UpdateEdgeProperty(updatedProperty, outEdgeField);
+                            outEdgeField.UpdateEdgeProperty(updatedProperty);
 
                         if (this.Connection.UseReverseEdges) {
                             // Modify edgeObject (update the edge property)
                             updatedProperty = GraphViewJsonCommand.UpdateProperty(inEdgeObject, keyExpression, valueExpression);
                         }
 
-                        // Update VertexCache
-                        if (updatedProperty == null)
-                            inEdgeField.EdgeProperties.Remove(keyExpression.Value);
-                        else
-                            inEdgeField.UpdateEdgeProperty(updatedProperty, inEdgeField);
+                        // Update VertexCache (if found)
+                        if (inEdgeField != null) {
+                            Debug.Assert(foundSink);
+                            if (updatedProperty == null)
+                                inEdgeField.EdgeProperties.Remove(keyExpression.Value);
+                            else
+                                inEdgeField.UpdateEdgeProperty(updatedProperty);
+                        }
                     }
                     else {
-                        throw new NotImplementedException();
+                        throw new GraphViewException("Edges can't have duplicated-name properties.");
                     }
                 }
             }

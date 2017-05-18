@@ -44,6 +44,7 @@ namespace GraphView
         //public const string KW_VERTEX_NEXTOFFSET = "_nextEdgeOffset";
         public const string KW_VERTEX_EDGE_SPILLED = "_edgeSpilled";
         public const string KW_VERTEX_REVEDGE_SPILLED = "_revEdgeSpilled";
+        public const string KW_VERTEX_DUMMY_EDGE = "dummy";
 
         public const string KW_PROPERTY_ID = "id";
         public const string KW_PROPERTY_VALUE = "_value";
@@ -60,9 +61,12 @@ namespace GraphView
         public const string KW_EDGE_SINKV_PARTITION = "_sinkVPartition";
 
         public const string KW_EDGEDOC_VERTEXID = "_vertex_id";
+        public const string KW_EDGEDOC_VERTEX_LABEL = "_vertex_label";
         public const string KW_EDGEDOC_ISREVERSE = "_is_reverse";
         public const string KW_EDGEDOC_EDGE = KW_VERTEX_EDGE;
         public const string KW_EDGEDOC_IDENTIFIER = "_isEdgeDoc";
+
+        public const int KW_DEFAULT_BATCH_SIZE = 1000;
 
         public static string KW_TABLE_DEFAULT_COLUMN_NAME = GremlinKeyword.TableDefaultColumnName;
 
