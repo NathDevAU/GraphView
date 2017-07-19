@@ -251,7 +251,7 @@ namespace GraphViewUnitTest.Gremlin
             //string authKey = ConfigurationManager.AppSettings["DocDBKey"];
             string authKey = ConfigurationManager.AppSettings["DocDBKeyLocal"];
             string databaseId = ConfigurationManager.AppSettings["DocDBDatabaseGremlin"];
-            string collectionId = ConfigurationManager.AppSettings["DocDBCollectionModern"];
+            string collectionId = ConfigurationManager.AppSettings["DocDBCollectionClassic"];
 
             GraphViewConnection connection = GraphViewConnection.ResetGraphAPICollection(endpoint, authKey, databaseId,
                 collectionId, AbstractGremlinTest.TEST_USE_REVERSE_EDGE,
