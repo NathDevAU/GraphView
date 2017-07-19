@@ -13,23 +13,61 @@ namespace GraphView
         private List<List<string>> StepLabelsAtThatMoment { get; set; }
         public List<GremlinToSqlContext> ByContexts { get; set; }
 
-        public GremlinPathVariable(List<GremlinVariable> stepList, List<GremlinToSqlContext> byContexts)
+        public GremlinPathVariable(List<GremlinVariable> stepList, List<GremlinToSqlContext> byContexts = null, string fromLabel = null, string toLabel = null)
             :base(GremlinVariableType.Table)
         {
             this.StepList = new List<GremlinVariable>();
             this.StepLabelsAtThatMoment = new List<List<string>>();
-            stepList.ForEach(this.AddStep);
-            this.ByContexts = byContexts;
-        }
-
-        //automatically generated path will use this constructor
-        public GremlinPathVariable(List<GremlinVariable> stepList)
-            : base(GremlinVariableType.Table)
-        {
-            this.StepList = new List<GremlinVariable>();
-            this.StepLabelsAtThatMoment = new List<List<string>>();
-            stepList.ForEach(this.AddStep);
-            this.ByContexts = new List<GremlinToSqlContext>();
+            if (toLabel != null)
+            {
+                bool findTo = false;
+                for (int i = stepList.Count - 1; i >= 0; i--)
+                {
+                    var step = stepList[i];
+                    if (!findTo)
+                    {
+                        if (step.Labels.Count != 0 && step.Labels.Contains(toLabel))
+                        {
+                            findTo = true;
+                        }
+                    }
+                    if (findTo)
+                    {
+                        AddStep(step);
+                        if (step.Labels.Count != 0 && step.Labels.Contains(fromLabel))
+                        {
+                            break;
+                        }
+                    }
+                }
+                this.StepList.Reverse();
+            }
+            else if (fromLabel != null)
+            {
+                for (int i = stepList.Count - 1; i >= 0; i--)
+                {
+                    var step = StepList[i];
+                    AddStep(step);
+                    if (step.Labels.Count != 0 && step.Labels.Contains(fromLabel))
+                    {
+                        break;
+                    }
+                   
+                }
+                this.StepList.Reverse();
+            }
+            else
+            {
+                stepList.ForEach(AddStep);
+            }
+            if (byContexts == null)
+            {
+                this.ByContexts = new List<GremlinToSqlContext>();
+            }
+            else
+            {
+                this.ByContexts = byContexts;
+            }
         }
 
         internal override List<GremlinVariable> FetchAllVars()
@@ -154,8 +192,8 @@ namespace GraphView
 
     internal class GremlinGlobalPathVariable : GremlinPathVariable
     {
-        public GremlinGlobalPathVariable(List<GremlinVariable> stepList, List<GremlinToSqlContext> byContexts)
-            : base(stepList, byContexts)
+        public GremlinGlobalPathVariable(List<GremlinVariable> stepList, List<GremlinToSqlContext> byContexts, string fromLabel, string toLabel)
+            : base(stepList, byContexts, fromLabel, toLabel)
         {
         }
 
